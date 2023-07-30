@@ -6,8 +6,9 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 import tensorflow_hub as hub
 
+#from attrdict import AttrDict
 
-class ExampleDataset(tfds.core.GeneratorBasedBuilder):
+class HydraV1(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for example dataset."""
 
     VERSION = tfds.core.Version('1.0.0')
@@ -20,35 +21,65 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
         self._embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-large/5")
 
     def _info(self) -> tfds.core.DatasetInfo:
-        """Dataset metadata (homepage, citation,...)."""
+        """
+        Dataset metadata 
+        real robot dataset for project HYDRA: Hybrid Robot Actions for Imitation Learning
+        homepage: https://sites.google.com/view/hydra-il-2023
+        robot: Franka Emika Panda
+        tasks: make coffee, make toast
+        raw npz file states:
+            ee_position (663, 3)
+            ee_orientation (663, 4)
+            ee_orientation_eul (663, 3)
+            q (663, 7)
+            qdot (663, 7)
+            gripper_width (663, 1)
+            gripper_pos (663, 1)
+            gripper_open (663, 1)
+            image (663, 240, 320, 3)
+            ego_image (663, 240, 320, 3)
+            action (663, 7)
+            click_state (663, 1)
+            reward (663, 1)
+            done (663,)
+            rollout_timestep (663,)
+        """
         return self.dataset_info_from_configs(
             features=tfds.features.FeaturesDict({
                 'steps': tfds.features.Dataset({
                     'observation': tfds.features.FeaturesDict({
                         'image': tfds.features.Image(
-                            shape=(64, 64, 3),
+                            shape=(240, 320, 3),
                             dtype=np.uint8,
                             encoding_format='png',
                             doc='Main camera RGB observation.',
                         ),
                         'wrist_image': tfds.features.Image(
-                            shape=(64, 64, 3),
+                            shape=(240, 320, 3),
                             dtype=np.uint8,
                             encoding_format='png',
                             doc='Wrist camera RGB observation.',
                         ),
                         'state': tfds.features.Tensor(
-                            shape=(10,),
+                            shape=(27,),
                             dtype=np.float32,
-                            doc='Robot state, consists of [7x robot joint angles, '
-                                '2x gripper position, 1x door opening angle].',
+                            doc='Robot state, consists of [3x EEF position,'
+                                '4x EEF orientation in quaternion,'
+                                '3x EEF orientation in euler angle,'
+                                '7x robot joint angles, '
+                                '7x robot joint velocities,' 
+                                '3x gripper state.',
                         )
                     }),
                     'action': tfds.features.Tensor(
-                        shape=(10,),
+                        shape=(7,),
                         dtype=np.float32,
-                        doc='Robot action, consists of [7x joint velocities, '
-                            '2x gripper velocities, 1x terminate episode].',
+                        doc='Robot action, consists of [3x EEF positional delta, '
+                            '3x EEF orientation delta in euler angle, 1x close gripper].',
+                    ),
+                    'is_dense': tfds.features.Scalar(
+                        dtype=np.bool_,
+                        doc='True if state is a waypoint(010) or in dense mode(x111).'
                     ),
                     'discount': tfds.features.Scalar(
                         dtype=np.float32,
@@ -90,36 +121,51 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
     def _split_generators(self, dl_manager: tfds.download.DownloadManager):
         """Define data splits."""
         return {
-            'train': self._generate_examples(path='data/train/episode_*.npy'),
-            'val': self._generate_examples(path='data/val/episode_*.npy'),
+            'train': self._generate_examples(),
         }
 
-    def _generate_examples(self, path) -> Iterator[Tuple[str, Any]]:
+    def _generate_examples(self) -> Iterator[Tuple[str, Any]]:
         """Generator of examples for each split."""
 
         def _parse_example(episode_path):
             # load raw data --> this should change for your dataset
-            data = np.load(episode_path, allow_pickle=True)     # this is a list of dicts in our case
+            #data = np.load(episode_path, allow_pickle=True)     # this is a list of dicts in our case
+            data = dict(np.load(episode_path, allow_pickle=True))
+            print(episode_path)
 
             # assemble episode --> here we're assuming demos so we set reward to 1 at the end
             episode = []
-            for i, step in enumerate(data):
+            langauge = ""
+            if "coffee" in episode_path:
+                language = "make a cup of coffee with the keurig machine"
+            elif "toast" in episode_path:
+                language = "make a piece of toast with the oven"
+            elif "dishes" in episode_path:
+                language = "palce dishes in the dish rack"
+            else:
+                language = "do something"
+
+            for i in range(data['rollout_timestep'].shape[0]):
                 # compute Kona language embedding
-                language_embedding = self._embed([step['language_instruction']])[0].numpy()
+                language_embedding = self._embed([language])[0].numpy()
+                robot_state = np.concatenate([data['ee_position'][i],data['ee_orientation'][i],
+                    data['ee_orientation_eul'][i],data['q'][i],data['qdot'][i],
+                    data['gripper_width'][i],data['gripper_pos'][i],data['gripper_open'][i]])
 
                 episode.append({
                     'observation': {
-                        'image': step['image'],
-                        'wrist_image': step['wrist_image'],
-                        'state': step['state'],
+                        'image': data['image'][i],
+                        'wrist_image': data['ego_image'][i],
+                        'state': robot_state,
                     },
-                    'action': step['action'],
+                    'action': data['action'][i],
+                    'is_dense': data['click_state'][i][0],
                     'discount': 1.0,
-                    'reward': float(i == (len(data) - 1)),
+                    'reward': float(i == ( data['rollout_timestep'].shape[0]- 1)),
                     'is_first': i == 0,
-                    'is_last': i == (len(data) - 1),
-                    'is_terminal': i == (len(data) - 1),
-                    'language_instruction': step['language_instruction'],
+                    'is_last': i == (data['rollout_timestep'].shape[0] - 1),
+                    'is_terminal': i == (data['rollout_timestep'].shape[0] - 1),
+                    'language_instruction': language,
                     'language_embedding': language_embedding,
                 })
 
@@ -131,20 +177,21 @@ class ExampleDataset(tfds.core.GeneratorBasedBuilder):
                 }
             }
 
+            del data
             # if you want to skip an example for whatever reason, simply return None
             return episode_path, sample
 
         # create list of all examples
-        episode_paths = glob.glob(path)
+        episode_paths = glob.glob('data/train/*.npz')
 
         # for smallish datasets, use single-thread parsing
         for sample in episode_paths:
             yield _parse_example(sample)
 
         # for large datasets use beam to parallelize data parsing (this will have initialization overhead)
-        # beam = tfds.core.lazy_imports.apache_beam
-        # return (
+        #beam = tfds.core.lazy_imports.apache_beam
+        #return (
         #         beam.Create(episode_paths)
         #         | beam.Map(_parse_example)
-        # )
+        #)
 
